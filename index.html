@@ -1,42 +1,252 @@
-<script src="https://digimarketingai.github.io/poke3d/code.js"></script>
- 
-<!DOCTYPE html>
+<!doctype html>
 <html>
 <head>
+  <meta charset="utf-8" />
+  <title>Pokemon AR — multilingual</title>
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <style>
+    body { font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; margin: 1rem; }
+    #controls { display:flex; gap:0.5rem; align-items:center; margin-bottom:1rem; }
+    #progress { width: 320px; height: 12px; background: #eee; border-radius: 6px; overflow:hidden; }
+    #progress > i { display:block; height:100%; width:0%; background:linear-gradient(90deg,#6ac,#3a9); transition:width .2s ease; }
+    .sr-only { position:absolute; left:-9999px; top:auto; width:1px; height:1px; overflow:hidden; }
+  </style>
+
+  <!-- Load the AR library once; defer so it executes after parsing -->
+  <script defer src="https://digimarketingai.github.io/poke3d/code.js"></script>
 </head>
 <body>
-    <script src="https://digimarketingai.github.io/poke3d/code.js"></script>
-    <script>
-        PokemonAR.init({
-            lang: "en",
+  <div id="controls" aria-hidden="false">
+    <label for="langSelect">Language</label>
+    <select id="langSelect" aria-label="Select language"></select>
+
+    <div id="status" aria-live="polite">Initializing…</div>
+  </div>
+
+  <div id="progress" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0" title="Loading models">
+    <i></i>
+  </div>
+
+  <script>
+    (function () {
+      // translation strings — move to /locales/*.json in production
+      const TRANSLATIONS = {
+        en: {
+          loading_models: "Loading models",
+          ready: "Ready",
+          error_lib: "AR library not available. Check network.",
+          pokemon_types: { GRASS: "Grass", FIRE: "Fire", WATER: "Water" }
+        },
+        zh_cn: {
+          loading_models: "加载模型中",
+          ready: "准备就绪",
+          error_lib: "无法加载 AR 库，请检查网络。",
+          pokemon_types: { GRASS: "草", FIRE: "火", WATER: "水" }
+        },
+        zh_tw: {
+          loading_models: "載入模型中",
+          ready: "準備就緒",
+          error_lib: "無法載入 AR 函式庫，請檢查網路。",
+          pokemon_types: { GRASS: "草", FIRE: "火", WATER: "水" }
+        }
+        // add more languages here
+      };
+
+      // Base pokemon config (canonical data)
+      const POKEMON_BASE = [
+        {
+          id: "001",
+          name: { en: "Bulbasaur", zh_tw: "妙蛙種子", zh_cn: "妙蛙种子" },
+          dex: "#001",
+          type_key: "GRASS",
+          color: "green",
+          model: "https://digimarketingai.github.io/pokemon3d/bulbasaur_s.glb"
+        },
+        {
+          id: "004",
+          name: { en: "Charmander", zh_tw: "小火龍", zh_cn: "小火龙" },
+          dex: "#004",
+          type_key: "FIRE",
+          color: "red",
+          model: "https://digimarketingai.github.io/pokemon3d/charmander_s.glb"
+        },
+        {
+          id: "007",
+          name: { en: "Squirtle", zh_tw: "傑尼龜", zh_cn: "杰尼龟" },
+          dex: "#007",
+          type_key: "WATER",
+          color: "blue",
+          model: "https://digimarketingai.github.io/pokemon3d/squirtle_s.glb"
+        }
+      ];
+
+      // UI elements
+      const statusEl = document.getElementById('status');
+      const progressBar = document.querySelector('#progress > i');
+      const progressWrapper = document.getElementById('progress');
+      const langSelect = document.getElementById('langSelect');
+
+      // Languages supported (sorted)
+      const LANGS = Object.keys(TRANSLATIONS);
+
+      // Detect browser language with fallbacks
+      function detectLang() {
+        const saved = localStorage.getItem('poke_ar_lang');
+        if (saved && LANGS.includes(saved)) return saved;
+        const nav = (navigator.languages && navigator.languages[0]) || navigator.language || 'en';
+        const short = nav.split('-')[0];
+        return LANGS.includes(nav) ? nav : (LANGS.includes(short) ? short : 'en');
+      }
+
+      // Populate language selector
+      function populateLangSelector(current) {
+        LANGS.forEach(l => {
+          const opt = document.createElement('option');
+          opt.value = l;
+          opt.textContent = l;
+          if (l === current) opt.selected = true;
+          langSelect.appendChild(opt);
+        });
+      }
+
+      // Translation helper — simple lookup with fallback to en
+      function t(lang, keyPath, defaultValue) {
+        const parts = keyPath.split('.');
+        let node = TRANSLATIONS[lang] || TRANSLATIONS['en'];
+        for (const p of parts) {
+          if (!node) break;
+          node = node[p];
+        }
+        return node === undefined ? (defaultValue === undefined ? keyPath : defaultValue) : node;
+      }
+
+      // Prefetch models with progress — caches responses in the page (and Cache Storage if desired)
+      async function prefetchModels(urls, onProgress) {
+        let totalBytes = 0;
+        const sizes = {}; // best-effort size map; servers might not give content-length
+        // First request HEAD to get sizes (optional and may be disallowed by CORS); fall back gracefully.
+        await Promise.all(urls.map(async url => {
+          try {
+            const head = await fetch(url, { method: 'HEAD' });
+            const cl = head.headers.get('content-length');
+            if (cl) sizes[url] = Number(cl);
+            totalBytes += sizes[url] || 0;
+          } catch (e) {
+            // ignore HEAD errors
+          }
+        }));
+
+        let loadedBytes = 0;
+        for (const url of urls) {
+          try {
+            const resp = await fetch(url);
+            if (!resp.ok) throw new Error(`Failed ${resp.status}`);
+            // If ReadableStream available, read and track progress (good UX for large models)
+            if (resp.body && resp.body.getReader) {
+              const reader = resp.body.getReader();
+              while (true) {
+                const { done, value } = await reader.read();
+                if (done) break;
+                loadedBytes += (value && value.length) ? value.length : 0;
+                const percent = totalBytes ? Math.round( (loadedBytes / (totalBytes || 1)) * 100 ) : 0;
+                onProgress(percent, url);
+              }
+            } else {
+              // fallback: no stream -> assume complete
+              loadedBytes += sizes[url] || 0;
+              onProgress(Math.round((loadedBytes/(totalBytes||1))*100), url);
+            }
+            // Optionally put into Cache Storage so subsequent loads are instant:
+            // caches.open('poke-models-v1').then(c => c.put(url, resp.clone()));
+          } catch (err) {
+            console.warn('prefetch failed for', url, err);
+            // continue; AR init should still try to fetch models itself
+          }
+        }
+        onProgress(100);
+      }
+
+      // Build localized pokemon array for PokemonAR.init
+      function localizedPokemon(lang) {
+        return POKEMON_BASE.map(p => {
+          // name: prefer exact lang field, fallback to en
+          const name = p.name[lang] || p.name[lang.split('-')[0]] || p.name.en || '';
+          // type label via translations
+          const typeLabel = (TRANSLATIONS[lang] && TRANSLATIONS[lang].pokemon_types && TRANSLATIONS[lang].pokemon_types[p.type_key]) ||
+                            (TRANSLATIONS['en'].pokemon_types && TRANSLATIONS['en'].pokemon_types[p.type_key]) ||
+                            p.type_key;
+          return {
+            name: { [lang]: name }, // keep same shape as original library expects (object per lang)
+            dex: p.dex,
+            type: { [lang]: typeLabel },
+            color: p.color,
+            model: p.model
+          };
+        });
+      }
+
+      // Update UI text (for simple UI strings)
+      function updateUIText(lang) {
+        const loadMsg = t(lang, 'loading_models', 'Loading models');
+        statusEl.textContent = loadMsg;
+      }
+
+      async function start() {
+        const lang = detectLang();
+        populateLangSelector(lang);
+        updateUIText(lang);
+
+        // change language handler
+        langSelect.addEventListener('change', () => {
+          const newLang = langSelect.value;
+          localStorage.setItem('poke_ar_lang', newLang);
+          // For a full app, you might re-render or re-init AR with new localized labels.
+          location.reload(); // simplest: reload and re-init with new lang
+        });
+
+        // Wait for AR library to load
+        if (!window.PokemonAR) {
+          // try waiting a short while in case the script is still loading
+          await new Promise(resolve => setTimeout(resolve, 200));
+        }
+        if (!window.PokemonAR) {
+          statusEl.textContent = t(lang, 'error_lib', 'AR library not available. Check network.');
+          console.error('PokemonAR library not available — check the script URL and network.');
+          return;
+        }
+
+        // Prefetch models and show progress
+        const modelUrls = POKEMON_BASE.map(p => p.model);
+        progressWrapper.style.display = 'block';
+        await prefetchModels(modelUrls, (percent, url) => {
+          progressBar.style.width = percent + '%';
+          progressWrapper.setAttribute('aria-valuenow', percent);
+          statusEl.textContent = `${t(lang, 'loading_models')}: ${percent}%`;
+        });
+
+        // Build localized pokemon config and init AR
+        const poks = localizedPokemon(lang);
+        try {
+          PokemonAR.init({
+            lang,
             maxCache: 6,
- 
-            pokemon:[
-                {
-                    name:{en: "Bulbasaur", zh_tw: "", zh_cn:""},
-                    dex: "#001",
-                    type: {en: "GRASS", zh_tw: "", zh_cn:""},
-                    color: "green",
-                    model: "https://digimarketingai.github.io/pokemon3d/bulbasaur_s.glb"
-                },
-                {
-                    name:{en: "Charmander", zh_tw: "", zh_cn:""},
-                    dex: "#004",
-                    type: {en: "Fire", zh_tw: "", zh_cn:""},
-                    color: "red",
-                    model: "https://digimarketingai.github.io/pokemon3d/charmander_s.glb"
-                },
-                {
-                    name:{en: "Squirtle", zh_tw: "", zh_cn:""},
-                    dex: "#007",
-                    type: {en: "Water", zh_tw: "", zh_cn:""},
-                    color: "blue",
-                    model: "https://digimarketingai.github.io/pokemon3d/squirtle_s.glb"
-                },
-            ]
-        })
-    </script>    
- 
+            pokemon: poks
+          });
+          statusEl.textContent = t(lang, 'ready', 'Ready');
+          progressBar.style.width = '100%';
+        } catch (err) {
+          console.error('PokemonAR.init failed', err);
+          statusEl.textContent = 'Init error — see console';
+        }
+      }
+
+      // Kick things off after DOM ready
+      if (document.readyState === 'loading') {
+        window.addEventListener('DOMContentLoaded', start);
+      } else {
+        start();
+      }
+    })();
+  </script>
 </body>
 </html>
- 
